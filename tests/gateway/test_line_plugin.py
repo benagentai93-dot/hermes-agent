@@ -674,3 +674,106 @@ class TestMessageTypeMapping:
     def test_unknown_type_falls_back_to_text(self):
         MessageType = _line.MessageType
         assert _line._LINE_MESSAGE_TYPES.get("flex", MessageType.TEXT) == MessageType.TEXT
+
+
+# ---------------------------------------------------------------------------
+# 9. Inbound media caching (image / voice / video / file)
+#
+# Regression for the iPhone-video bug: LINE videos were funneled through
+# cache_image_from_bytes, whose image magic-byte check rejected mp4 payloads
+# ("Refusing to cache non-image data as .mp4"), silently dropping the media
+# so the agent only ever saw "[video]" with no file path to analyze.
+# ---------------------------------------------------------------------------
+
+# Minimal valid magic-byte payloads per format.
+_FAKE_MP4 = b"\x00\x00\x00\x1cftypmp42" + b"\x00" * 64   # iPhone via LINE: ftypmp42
+_FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+_FAKE_M4A = b"\x00\x00\x00\x1cftypM4A " + b"\x00" * 64
+
+
+class TestInboundMedia:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch, tmp_path):
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "IMAGE_CACHE_DIR", tmp_path / "images")
+        monkeypatch.setattr(base, "AUDIO_CACHE_DIR", tmp_path / "audio")
+        monkeypatch.setattr(base, "VIDEO_CACHE_DIR", tmp_path / "videos")
+        monkeypatch.setattr(base, "DOCUMENT_CACHE_DIR", tmp_path / "documents")
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+        })
+        ad = LineAdapter(cfg)
+        ad._client = MagicMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        ad._client.loading = AsyncMock()
+        return ad
+
+    def _media_event(self, msg: dict) -> dict:
+        return {
+            "type": "message",
+            "replyToken": "rt",
+            "source": {"type": "user", "userId": "U123"},
+            "message": msg,
+        }
+
+    def test_video_bytes_cached_as_mp4(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=_FAKE_MP4)
+        cached = asyncio.run(adapter._download_media("mid-v", "video"))
+        assert cached is not None
+        assert cached.path.endswith(".mp4")
+        assert cached.media_type == "video/mp4"
+        from pathlib import Path
+        assert Path(cached.path).read_bytes() == _FAKE_MP4
+
+    def test_audio_bytes_cached_as_m4a(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=_FAKE_M4A)
+        cached = asyncio.run(adapter._download_media("mid-a", "audio"))
+        assert cached is not None
+        assert cached.path.endswith(".m4a")
+        assert cached.media_type.startswith("audio/")
+
+    def test_image_bytes_still_cached(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=_FAKE_JPEG)
+        cached = asyncio.run(adapter._download_media("mid-i", "image"))
+        assert cached is not None
+        assert cached.media_type.startswith("image/")
+
+    def test_non_image_bytes_as_image_rejected(self, adapter):
+        # HTML error page must still be refused for image messages.
+        adapter._client.fetch_content = AsyncMock(return_value=b"<html>oops</html>" * 8)
+        cached = asyncio.run(adapter._download_media("mid-x", "image"))
+        assert cached is None
+
+    def test_inbound_video_event_surfaces_local_path(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=_FAKE_MP4)
+        adapter.handle_message = AsyncMock()
+        event = self._media_event({"type": "video", "id": "mid-v2"})
+        asyncio.run(adapter._handle_message_event(event))
+        evt = adapter.handle_message.call_args.args[0]
+        assert evt.media_urls and evt.media_urls[0].endswith(".mp4")
+        assert evt.media_types == ["video/mp4"]
+        # The agent learns the path from the transcript note.
+        assert "saved at" in evt.text
+        assert evt.message_type == _line.MessageType.VIDEO
+
+    def test_inbound_file_uses_filename(self, adapter):
+        adapter._client.fetch_content = AsyncMock(return_value=b"%PDF-1.4 fake")
+        adapter.handle_message = AsyncMock()
+        event = self._media_event({"type": "file", "id": "mid-f", "fileName": "plan.pdf"})
+        asyncio.run(adapter._handle_message_event(event))
+        evt = adapter.handle_message.call_args.args[0]
+        assert evt.media_urls and evt.media_urls[0].endswith(".pdf")
+        assert "plan.pdf" in evt.text
+
+    def test_failed_fetch_keeps_placeholder_text(self, adapter):
+        adapter._client.fetch_content = AsyncMock(side_effect=RuntimeError("boom"))
+        adapter.handle_message = AsyncMock()
+        event = self._media_event({"type": "video", "id": "mid-err"})
+        asyncio.run(adapter._handle_message_event(event))
+        evt = adapter.handle_message.call_args.args[0]
+        assert evt.media_urls == []
+        assert evt.text == "[video]"

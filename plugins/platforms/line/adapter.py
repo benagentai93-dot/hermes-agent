@@ -89,10 +89,11 @@ logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    CachedMedia,
     MessageEvent,
     MessageType,
     SendResult,
-    cache_image_from_bytes,
+    cache_media_bytes,
 )
 from gateway.config import Platform
 
@@ -954,11 +955,21 @@ class LineAdapter(BasePlatformAdapter):
         if msg_type == "text":
             text = msg.get("text", "") or ""
         elif msg_type in {"image", "audio", "video", "file"}:
-            local_path = await self._download_media(message_id, msg_type)
-            if local_path:
-                media_urls.append(local_path)
-                media_types.append(msg_type)
-            text = f"[{msg_type}]"
+            cached = await self._download_media(
+                message_id, msg_type, file_name=msg.get("fileName", "") or ""
+            )
+            if cached:
+                media_urls.append(cached.path)
+                media_types.append(cached.media_type)
+                # Videos and files have no gateway enrichment pipeline (unlike
+                # images/voice), so the transcript note is how the agent
+                # learns the local path to pass to video_analyze etc.
+                if msg_type in {"video", "file"}:
+                    text = cached.context_note()
+                else:
+                    text = f"[{msg_type}]"
+            else:
+                text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
             text = f"[sticker: {', '.join(keywords)}]" if keywords else "[sticker]"
@@ -1052,7 +1063,9 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-    async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
+    async def _download_media(
+        self, message_id: str, msg_type: str, file_name: str = ""
+    ) -> Optional[CachedMedia]:
         if not self._client or not message_id:
             return None
         try:
@@ -1060,17 +1073,26 @@ class LineAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
             return None
-        ext = {
-            "image": ".jpg",
-            "audio": ".m4a",
-            "video": ".mp4",
-            "file": ".bin",
-        }.get(msg_type, ".bin")
+        # LINE serves images as JPEG, voice clips as AAC/M4A, videos as MP4.
+        # "file" messages carry the original fileName in the webhook payload.
+        if not file_name:
+            file_name = {
+                "image": "line_image.jpg",
+                "audio": "line_voice.m4a",
+                "video": "line_video.mp4",
+            }.get(msg_type, "")
+        default_kind = msg_type if msg_type in {"image", "audio", "video"} else None
         try:
-            return cache_image_from_bytes(data, ext=ext)
+            cached = cache_media_bytes(data, filename=file_name, default_kind=default_kind)
         except Exception as exc:
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
             return None
+        if cached is None:
+            logger.warning(
+                "LINE: %s payload not cached (invalid or unsupported type, filename=%r)",
+                msg_type, file_name,
+            )
+        return cached
 
     # ------------------------------------------------------------------
     # Outbound send (text)
