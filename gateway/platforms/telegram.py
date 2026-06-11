@@ -9,6 +9,7 @@ Uses python-telegram-bot library for:
 
 import asyncio
 import dataclasses
+import itertools
 import json
 import logging
 import os
@@ -481,6 +482,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Feedback button state: feedback_id → {chat_id, message_id, thread_id,
+        # excerpt} for the final-reply "report error" inline button
+        # (TELEGRAM_FEEDBACK_BUTTON / telegram.feedback_button).
+        self._feedback_state: Dict[int, Dict[str, Any]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -3278,6 +3283,42 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Final-reply feedback callbacks (vf:id) ---
+        if data.startswith("vf:"):
+            try:
+                feedback_id = int(data.split(":", 1)[1])
+            except (ValueError, IndexError):
+                await query.answer(text="Invalid feedback data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to report on this reply.")
+                return
+
+            state = self._feedback_state.pop(feedback_id, None)
+            if not state:
+                await query.answer(text="This report has already been handled.")
+                return
+
+            await query.answer(text="✅ 已回報，重新查核中")
+            # Remove the button so the report can't be double-fired.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass  # non-fatal if button removal fails
+
+            feedback_event = self._build_feedback_event(query, state)
+            if feedback_event is not None:
+                await self.handle_message(feedback_event)
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -6014,6 +6055,105 @@ class TelegramAdapter(BasePlatformAdapter):
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
+        )
+
+    # ── Feedback button (final replies) ────────────────────────────────────
+
+    _FEEDBACK_STATE_MAX = 200
+
+    def _feedback_button_enabled(self) -> bool:
+        """Check if the final-reply feedback button is enabled via config/env."""
+        return os.getenv("TELEGRAM_FEEDBACK_BUTTON", "false").lower() not in {"false", "0", "no"}
+
+    async def attach_feedback_control(
+        self,
+        event: MessageEvent,
+        send_result: SendResult,
+        text_content: str,
+    ) -> None:
+        """Attach a "report error" inline button to a delivered final reply.
+
+        Clicking the button injects a synthetic correction request back into
+        the same conversation so the agent re-examines its answer (and
+        profile hooks such as harness-learning capture the correction).
+        Enabled via ``telegram.feedback_button`` / ``TELEGRAM_FEEDBACK_BUTTON``.
+        """
+        if not self._feedback_button_enabled() or not self._bot:
+            return
+        if not TELEGRAM_AVAILABLE:
+            return
+        raw = getattr(send_result, "raw_response", None) or {}
+        message_ids = raw.get("message_ids") or []
+        # Multi-chunk replies: the button belongs on the last chunk, but
+        # SendResult.message_id is the first chunk's id.
+        target_id = message_ids[-1] if message_ids else send_result.message_id
+        if not target_id:
+            return
+
+        if not hasattr(self, "_feedback_counter"):
+            self._feedback_counter = itertools.count(1)
+        feedback_id = next(self._feedback_counter)
+
+        # Bound the state dict — old un-clicked buttons simply expire.
+        while len(self._feedback_state) >= self._FEEDBACK_STATE_MAX:
+            self._feedback_state.pop(next(iter(self._feedback_state)))
+        self._feedback_state[feedback_id] = {
+            "chat_id": str(event.source.chat_id),
+            "message_id": str(target_id),
+            "thread_id": event.source.thread_id,
+            "excerpt": (text_content or "")[:600],
+        }
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ 回報錯誤", callback_data=f"vf:{feedback_id}"),
+        ]])
+        try:
+            await self._bot.edit_message_reply_markup(
+                chat_id=int(event.source.chat_id),
+                message_id=int(target_id),
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            self._feedback_state.pop(feedback_id, None)
+            logger.debug("[%s] feedback button attach failed: %s", self.name, e)
+
+    def _build_feedback_event(
+        self, query: Any, state: Dict[str, Any]
+    ) -> Optional[MessageEvent]:
+        """Build a synthetic MessageEvent for a feedback-button click."""
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        user = getattr(query, "from_user", None)
+        if message is None or chat is None or user is None:
+            return None
+
+        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_type = "dm"
+        if telegram_chat_type in {"group", "supergroup"}:
+            chat_type = "group"
+        elif telegram_chat_type == "channel":
+            chat_type = "channel"
+
+        source = self.build_source(
+            chat_id=str(chat.id),
+            chat_name=getattr(chat, "title", None),
+            chat_type=chat_type,
+            user_id=str(user.id),
+            user_name=getattr(user, "full_name", None) or getattr(user, "first_name", None),
+            thread_id=state.get("thread_id"),
+            message_id=str(message.message_id),
+        )
+        return MessageEvent(
+            text=(
+                "使用者按下「回報錯誤」按鈕：被回報的這則回覆內容有誤。"
+                "請重新檢視，指出錯在哪裡並給出修正後的結論。"
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=message,
+            message_id=str(message.message_id),
+            reply_to_message_id=state.get("message_id"),
+            reply_to_text=state.get("excerpt") or None,
         )
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
