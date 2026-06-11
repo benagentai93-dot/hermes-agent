@@ -4035,6 +4035,21 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    async def attach_feedback_control(
+        self,
+        event: MessageEvent,
+        send_result: "SendResult",
+        text_content: str,
+    ) -> None:
+        """Platform hook: attach a feedback affordance to a delivered final reply.
+
+        No-op by default. Adapters with interactive message controls (e.g.
+        Telegram inline keyboards) override this to add a "report error"
+        button to the final response message so the user can flag a wrong
+        answer with one tap.
+        """
+        return None
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -4260,6 +4275,18 @@ class BasePlatformAdapter(ABC):
                             message_id=result.message_id,
                             ttl_seconds=_ephemeral_ttl,
                         )
+
+                    # Platform-specific feedback affordance on the final reply
+                    # (e.g. Telegram "report error" inline button). Skipped for
+                    # ephemeral system notices; must never break delivery.
+                    if result.success and result.message_id and not _ephemeral_ttl:
+                        try:
+                            await self.attach_feedback_control(event, result, text_content)
+                        except Exception as _fb_err:
+                            logger.debug(
+                                "[%s] attach_feedback_control failed: %s",
+                                self.name, _fb_err,
+                            )
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
